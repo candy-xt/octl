@@ -1,0 +1,15 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.vscode/
+.idea/
+.python-version
+.env
+*.env
+.pytest_cache/
+.coverage
+htmlcov/
