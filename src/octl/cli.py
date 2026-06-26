@@ -66,6 +66,9 @@ def _print_sessions_table(data: list[dict]) -> None:
     if not data:
         console.print("[dim]No sessions[/dim]")
         return
+    from datetime import datetime, timezone, timedelta
+
+    tz = timezone(timedelta(hours=8))
     table = Table(title="Sessions")
     table.add_column("ID", style="cyan", max_width=12)
     table.add_column("Title")
@@ -73,7 +76,12 @@ def _print_sessions_table(data: list[dict]) -> None:
     for s in data:
         sid = s.get("id", "")[:12]
         title = s.get("title", "(untitled)")
-        created = s.get("createdAt", "")[:19]
+        created_ts = s.get("time", {}).get("created", 0)
+        if created_ts:
+            dt = datetime.fromtimestamp(created_ts / 1000, tz=tz)
+            created = dt.strftime("%m-%d %H:%M")
+        else:
+            created = ""
         table.add_row(sid, title, created)
     console.print(table)
 
@@ -543,6 +551,39 @@ def session_use(ctx: click.Context, session_id: str) -> None:
     set_active_session(session_id)
     if not ctx.obj.get("quiet"):
         console.print(f"  [green]Active session:[/green] {session_id[:12]}")
+
+
+@session.command("messages")
+@click.argument("session_id", required=False, default=None)
+@click.option("--limit", "-n", default=None, type=int, help="Max messages to show")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
+@click.pass_context
+def session_messages(
+    ctx: click.Context, session_id: str | None, limit: int | None, as_json: bool
+) -> None:
+    """List messages in a session."""
+    sid = resolve_session(session_id)
+    if not sid:
+        print_error("No session ID provided and no active session")
+        sys.exit(1)
+    client = get_client(ctx.obj.get("url"))
+    data = client.message_list(sid, limit=limit)
+    if should_output_json(as_json, ctx):
+        print_json(data)
+        return
+
+    for msg in data:
+        info = msg.get("info", {})
+        parts = msg.get("parts", [])
+        role = info.get("role", "?")
+        mid = info.get("id", "")[:12]
+        for part in parts:
+            if part.get("type") == "text":
+                text = part.get("text", "")
+                if role == "user":
+                    console.print(f"  [cyan]{role}[/cyan] {mid}: {text[:100]}")
+                else:
+                    console.print(f"  [green]{role}[/green] {mid}: {text[:200]}")
 
 
 # ── file group ──

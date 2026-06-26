@@ -93,7 +93,21 @@ class OpenCodeClient:
     def session_status(self, session_id: str | None = None) -> dict:
         if session_id:
             all_status = self._get("/session/status")
-            return all_status.get(session_id, {})
+            result = all_status.get(session_id, {})
+            if result:
+                return result
+            # Fallback: check last message for completed timestamp
+            try:
+                messages = self.message_list(session_id, limit=1)
+                if messages:
+                    last_msg = messages[-1]
+                    completed = last_msg.get("info", {}).get("time", {}).get("completed")
+                    if completed:
+                        return {"state": "idle"}
+                    return {"state": "running"}
+            except Exception:
+                pass
+            return {"state": "unknown"}
         return self._get("/session/status")
 
     def session_delete(self, session_id: str) -> bool:
