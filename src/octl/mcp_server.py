@@ -1,366 +1,311 @@
-"""octl MCP Server — stdio transport, full CLI coverage."""
+"""octl MCP Server — stdio transport, consolidated tools."""
 
 from __future__ import annotations
 
 import json
 import os
+import time
+import threading
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from fastmcp import FastMCP
 
 from octl.client import OpenCodeClient
 
-mcp = FastMCP(
-    "octl",
-    instructions="Agent-friendly CLI for controlling OpenCode server. "
-    "Provides session management, message listing, file operations, "
-    "and prompt sending via the OpenCode API.",
-)
+mcp = FastMCP("octl")
 
-# ── client singleton ──
+TZ = timezone(timedelta(hours=8))
 
 
-def _get_client() -> OpenCodeClient:
+def _client() -> OpenCodeClient:
     url = os.environ.get("OPENCODE_URL", "http://127.0.0.1:4096")
     password = os.environ.get("OPENCODE_SERVER_PASSWORD")
     return OpenCodeClient(base_url=url, password=password)
 
 
-# ── health / status ──
+def _ts(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=TZ).strftime("%m-%d %H:%M")
+
+
+# ── 1. server: health + providers + config ──
 
 
 @mcp.tool()
-def server_status() -> str:
-    """Check OpenCode server health and version."""
-    client = _get_client()
-    h = client.health()
-    if h.get("healthy"):
-        return f"OK  v{h.get('version', '?')}"
-    return f"Unhealthy: {json.dumps(h, ensure_ascii=False)}"
+def server(action: str = "status") -> str:
+    """OpenCode server operations.
+
+    Args:
+        action: One of 'status' (health check), 'providers' (list models), 'config' (show config).
+    """
+    c = _client()
+    if action == "status":
+        h = c.health()
+        return f"OK  v{h.get('version', '?')}" if h.get("healthy") else f"Unhealthy: {h}"
+    if action == "providers":
+        data = c.providers()
+        connected = set(data.get("connected", []))
+        lines = []
+        for p in data.get("all", []):
+            pid = p.get("id", "")
+            s = "connected" if pid in connected else "disconnected"
+            m = data.get("default", {}).get(pid, "")
+            lines.append(f"  {pid} [{s}] {m}")
+        return "\n".join(lines) or "No providers"
+    if action == "config":
+        return json.dumps(c.config_get(), ensure_ascii=False, default=str)
+    return f"Unknown action: {action}"
+
+
+# ── 2. session: all session operations ──
 
 
 @mcp.tool()
-def server_providers() -> str:
-    """List available providers and models."""
-    client = _get_client()
-    data = client.providers()
-    connected = data.get("connected", [])
-    all_providers = data.get("all", [])
-    defaults = data.get("default", {})
-    lines = []
-    for p in all_providers:
-        pid = p.get("id", "")
-        status = "connected" if pid in connected else "disconnected"
-        model = defaults.get(pid, "")
-        lines.append(f"  {pid}  [{status}]  {model}")
-    return "\n".join(lines) if lines else "No providers"
+def session(
+    action: str,
+    session_id: str | None = None,
+    title: str | None = None,
+    message_id: str | None = None,
+) -> Any:
+    """Manage OpenCode sessions.
+
+    Args:
+        action: One of 'list', 'get', 'new', 'delete', 'status', 'abort', 'diff', 'revert'.
+        session_id: Required for get/delete/status/abort/diff/revert.
+        title: Optional title for 'new'.
+        message_id: Required for 'revert'.
+    """
+    c = _client()
+
+    if action == "list":
+        data = c.session_list()
+        if not data:
+            return "No sessions"
+        lines = []
+        for s in data:
+            sid = s.get("id", "")[:16]
+            title_ = s.get("title", "(untitled)")
+            ts = s.get("time", {}).get("created", 0)
+            lines.append(f"  {sid}  {_ts(ts) if ts else '?'}  {title_}")
+        return "\n".join(lines)
+
+    if action == "get":
+        if not session_id:
+            return "session_id required"
+        return json.dumps(c.session_get(session_id), ensure_ascii=False, default=str)
+
+    if action == "new":
+        data = c.session_create(title=title)
+        return f"Created session {data['id'][:16]}"
+
+    if action == "delete":
+        if not session_id:
+            return "session_id required"
+        c.session_delete(session_id)
+        return f"Deleted {session_id[:16]}"
+
+    if action == "status":
+        if session_id:
+            data = c.session_status(session_id)
+            return f"{session_id[:16]}  state: {data.get('state', 'unknown')}"
+        data = c.session_status()
+        if not data:
+            return "No running sessions"
+        return "\n".join(f"  {s[:16]}  {d.get('state', '?')}" for s, d in data.items())
+
+    if action == "abort":
+        if not session_id:
+            return "session_id required"
+        c.session_abort(session_id)
+        return f"Aborted {session_id[:16]}"
+
+    if action == "diff":
+        if not session_id:
+            return "session_id required"
+        data = c.session_diff(session_id)
+        if not data:
+            return "No changes"
+        return "\n".join(f"  +{f.get('additions',0)} -{f.get('deletions',0)}  {f.get('path','')}" for f in data)
+
+    if action == "revert":
+        if not session_id or not message_id:
+            return "session_id and message_id required"
+        c.session_revert(session_id, message_id)
+        return f"Reverted {message_id[:16]} in {session_id[:16]}"
+
+    return f"Unknown action: {action}"
+
+
+# ── 3. message: list + get ──
 
 
 @mcp.tool()
-def server_config() -> dict:
-    """Show server configuration."""
-    client = _get_client()
-    return client.config_get()
+def message(
+    action: str = "list",
+    session_id: str | None = None,
+    message_id: str | None = None,
+    limit: int | None = None,
+) -> Any:
+    """List or get messages in a session.
+
+    Args:
+        action: 'list' or 'get'.
+        session_id: Required. Session to query.
+        message_id: Required for 'get'.
+        limit: Max messages for 'list'.
+    """
+    if not session_id:
+        return "session_id required"
+    c = _client()
+
+    if action == "list":
+        data = c.message_list(session_id, limit=limit)
+        if not data:
+            return "No messages"
+        lines = []
+        for msg in data:
+            info = msg.get("info", {})
+            role = info.get("role", "?")
+            mid = info.get("id", "")[:16]
+            for part in msg.get("parts", []):
+                pt = part.get("type", "")
+                if pt == "text":
+                    lines.append(f"  {role} {mid}: {part.get('text', '')[:200]}")
+                elif pt == "tool":
+                    st = part.get("state", {})
+                    d = st.get("input", {}).get("description", st.get("input", {}).get("filePath", ""))
+                    lines.append(f"  {role} {mid}: [{part.get('tool','')}] {st.get('status','')} {d}")
+                elif pt == "reasoning":
+                    lines.append(f"  {role} {mid}: reasoning: {part.get('text', '')[:150]}")
+        return "\n".join(lines)
+
+    if action == "get":
+        if not message_id:
+            return "message_id required"
+        return json.dumps(c.message_get(session_id, message_id), ensure_ascii=False, default=str)
+
+    return f"Unknown action: {action}"
 
 
-# ── sessions ──
-
-
-@mcp.tool()
-def session_list() -> str:
-    """List all sessions with ID, title, and creation time."""
-    from datetime import datetime, timezone, timedelta
-
-    tz = timezone(timedelta(hours=8))
-    client = _get_client()
-    data = client.session_list()
-    if not data:
-        return "No sessions"
-    lines = []
-    for s in data:
-        sid = s.get("id", "")[:16]
-        title = s.get("title", "(untitled)")
-        ts = s.get("time", {}).get("created", 0)
-        if ts:
-            dt = datetime.fromtimestamp(ts / 1000, tz=tz)
-            created = dt.strftime("%m-%d %H:%M")
-        else:
-            created = "?"
-        lines.append(f"  {sid}  {created}  {title}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def session_get(session_id: str) -> dict:
-    """Get full session details (ID, title, tokens, timestamps, etc.)."""
-    client = _get_client()
-    return client.session_get(session_id)
-
-
-@mcp.tool()
-def session_new(title: str | None = None) -> dict:
-    """Create a new session. Returns session ID and details."""
-    client = _get_client()
-    data = client.session_create(title=title)
-    return {"session_id": data["id"], "title": data.get("title"), "created": data.get("time", {}).get("created")}
-
-
-@mcp.tool()
-def session_delete(session_id: str) -> str:
-    """Delete a session by ID."""
-    client = _get_client()
-    client.session_delete(session_id)
-    return f"Deleted session {session_id[:16]}"
+# ── 4. send: sync + async ──
 
 
 @mcp.tool()
-def session_status(session_id: str | None = None) -> str:
-    """Show session running state. Pass session_id for a specific session, or None for all."""
-    client = _get_client()
-    if session_id:
-        data = client.session_status(session_id)
-        state = data.get("state", "unknown")
-        return f"{session_id[:16]}  state: {state}"
-    data = client.session_status()
-    if not data:
-        return "No running sessions"
-    lines = []
-    for sid, status in data.items():
-        state = status.get("state", "unknown")
-        lines.append(f"  {sid[:16]}  {state}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def session_abort(session_id: str) -> str:
-    """Abort a running session."""
-    client = _get_client()
-    client.session_abort(session_id)
-    return f"Aborted session {session_id[:16]}"
-
-
-@mcp.tool()
-def session_diff(session_id: str) -> str:
-    """Show file changes made in a session."""
-    client = _get_client()
-    data = client.session_diff(session_id)
-    if not data:
-        return "No changes"
-    lines = []
-    for f in data:
-        path = f.get("path", "")
-        adds = f.get("additions", 0)
-        dels = f.get("deletions", 0)
-        lines.append(f"  +{adds} -{dels}  {path}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def session_revert(session_id: str, message_id: str) -> str:
-    """Revert changes made by a specific message in a session."""
-    client = _get_client()
-    client.session_revert(session_id, message_id)
-    return f"Reverted message {message_id[:16]} in session {session_id[:16]}"
-
-
-# ── messages ──
-
-
-@mcp.tool()
-def message_list(session_id: str, limit: int | None = None) -> str:
-    """List messages in a session. Optionally limit the count."""
-    client = _get_client()
-    data = client.message_list(session_id, limit=limit)
-    if not data:
-        return "No messages"
-    lines = []
-    for msg in data:
-        info = msg.get("info", {})
-        role = info.get("role", "?")
-        mid = info.get("id", "")[:16]
-        parts = msg.get("parts", [])
-        for part in parts:
-            ptype = part.get("type", "")
-            if ptype == "text":
-                text = part.get("text", "")[:200]
-                lines.append(f"  {role} {mid}: {text}")
-            elif ptype == "tool":
-                tool = part.get("tool", "")
-                state = part.get("state", {})
-                status = state.get("status", "")
-                inp = state.get("input", {})
-                desc = inp.get("description", inp.get("filePath", inp.get("command", "")[:80]))
-                lines.append(f"  {role} {mid}: [{tool}] {status} - {desc}")
-            elif ptype == "reasoning":
-                text = part.get("text", "")[:150]
-                lines.append(f"  {role} {mid}: reasoning: {text}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def message_get(session_id: str, message_id: str) -> dict:
-    """Get full details of a specific message."""
-    client = _get_client()
-    return client.message_get(session_id, message_id)
-
-
-# ── send ──
-
-
-@mcp.tool()
-def send_prompt(
+def send(
     prompt: str,
     session_id: str | None = None,
     model: str | None = None,
     provider: str | None = None,
     agent: str | None = None,
+    async_mode: bool = False,
     timeout: float = 300.0,
-) -> dict:
-    """Send a prompt to a session and wait for response. Creates a new session if none provided."""
-    client = _get_client()
-    result = client.send_and_wait(
-        prompt=prompt,
-        session_id=session_id,
-        model=model,
-        provider=provider,
-        agent=agent,
-        timeout=timeout,
+) -> Any:
+    """Send a prompt to OpenCode and optionally wait for response.
+
+    Args:
+        prompt: The prompt text to send.
+        session_id: Target session. Creates new if omitted.
+        model: Model override.
+        provider: Provider override.
+        agent: Agent override.
+        async_mode: If True, fire-and-forget (don't wait).
+        timeout: Max seconds to wait (sync mode only).
+    """
+    c = _client()
+    if async_mode:
+        if not session_id:
+            s = c.session_create()
+            session_id = s["id"]
+        c.message_send_async(
+            session_id, [{"type": "text", "text": prompt}],  # type: ignore[arg-type]
+            model=model, provider=provider, agent=agent,
+        )
+        return f"Sent to {session_id[:16]}"
+
+    result = c.send_and_wait(
+        prompt=prompt, session_id=session_id,
+        model=model, provider=provider, agent=agent, timeout=timeout,
     )
-    # Extract text from the last assistant message
     last_text = ""
     for msg in result.get("messages", []):
-        info = msg.get("info", {})
-        if info.get("role") == "assistant":
+        if msg.get("info", {}).get("role") == "assistant":
             for part in msg.get("parts", []):
                 if part.get("type") == "text":
                     last_text = part.get("text", "")
-    return {
-        "session_id": result["session_id"],
-        "response": last_text,
-    }
+    return {"session_id": result["session_id"], "response": last_text}
+
+
+# ── 5. file: list/read/search/find ──
 
 
 @mcp.tool()
-def send_prompt_async(
-    prompt: str,
-    session_id: str | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-    agent: str | None = None,
-) -> dict:
-    """Send a prompt without waiting for response (fire and forget)."""
-    client = _get_client()
-    if not session_id:
-        s = client.session_create()
-        session_id = s["id"]
-    client.message_send_async(
-        session_id,
-        [{"type": "text", "text": prompt}],
-        model=model,
-        provider=provider,
-        agent=agent,
-    )
-    return {"session_id": session_id, "status": "sent"}
+def file(action: str = "list", path: str = ".", pattern: str = "", query: str = "") -> Any:
+    """File operations on the OpenCode server workspace.
+
+    Args:
+        action: One of 'list', 'read', 'search', 'find'.
+        path: Directory path for 'list', file path for 'read'.
+        pattern: Regex pattern for 'search'.
+        query: Filename pattern for 'find'.
+    """
+    c = _client()
+
+    if action == "list":
+        data = c.file_list(path)
+        if not data:
+            return "Empty"
+        return "\n".join(f"  {'/' if i.get('type')=='directory' else ' '} {i.get('name','')}" for i in data)
+
+    if action == "read":
+        if not path:
+            return "path required"
+        return c.file_read(path).get("content", "")
+
+    if action == "search":
+        if not pattern:
+            return "pattern required"
+        data = c.file_search(pattern)
+        if not data:
+            return "No matches"
+        return "\n".join(f"  {m.get('path','')}:{m.get('line_number',0)}: {m.get('lines','').strip()}" for m in data)
+
+    if action == "find":
+        if not query:
+            return "query required"
+        data = c.file_find(query)
+        return "\n".join(f"  {p}" for p in data) if data else "No files found"
+
+    return f"Unknown action: {action}"
 
 
-# ── files ──
-
-
-@mcp.tool()
-def file_list(path: str = ".") -> str:
-    """List files and directories at a path."""
-    client = _get_client()
-    data = client.file_list(path)
-    lines = []
-    for item in data:
-        name = item.get("name", "")
-        kind = item.get("type", "")
-        icon = "/" if kind == "directory" else " "
-        lines.append(f"  {icon} {name}")
-    return "\n".join(lines) if lines else "Empty directory"
-
-
-@mcp.tool()
-def file_read(path: str) -> str:
-    """Read file content."""
-    client = _get_client()
-    data = client.file_read(path)
-    return data.get("content", "")
+# ── 6. agents ──
 
 
 @mcp.tool()
-def file_search(pattern: str) -> str:
-    """Search file contents by regex pattern."""
-    client = _get_client()
-    data = client.file_search(pattern)
-    if not data:
-        return "No matches"
-    lines = []
-    for match in data:
-        path = match.get("path", "")
-        line_num = match.get("line_number", 0)
-        text = match.get("lines", "").strip()
-        lines.append(f"  {path}:{line_num}: {text}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def file_find(query: str) -> str:
-    """Find files by name pattern."""
-    client = _get_client()
-    data = client.file_find(query)
-    if not data:
-        return "No files found"
-    return "\n".join(f"  {p}" for p in data)
-
-
-# ── agents ──
-
-
-@mcp.tool()
-def agent_list() -> str:
+def agents() -> str:
     """List available agents."""
-    client = _get_client()
-    data = client.agent_list()
+    data = _client().agent_list()
     if not data:
         return "No agents"
-    lines = []
-    for a in data:
-        aid = a.get("id", "")
-        name = a.get("name", "")
-        lines.append(f"  {aid}  {name}")
-    return "\n".join(lines)
+    return "\n".join(f"  {a.get('id','')}  {a.get('name','')}" for a in data)
 
 
-# ── events ──
+# ── 7. events ──
 
 
 @mcp.tool()
-def events_subscribe(duration_seconds: int = 30) -> str:
-    """Subscribe to server events for a limited time. Returns collected events as JSON."""
-    client = _get_client()
-    events: list[dict] = []
+def events(duration_seconds: int = 30) -> str:
+    """Subscribe to server events for a limited time.
 
-    import time
-
-    start = time.time()
-
-    def on_event(event: dict) -> None:
-        events.append(event)
-
-    try:
-        # events() blocks, we need to run it in a thread with a timeout
-        import threading
-
-        t = threading.Thread(target=client.events, kwargs={"callback": on_event}, daemon=True)
-        t.start()
-        t.join(timeout=duration_seconds)
-    except Exception:
-        pass
-
-    if not events:
-        return "No events received"
-    return json.dumps(events, ensure_ascii=False, default=str)
+    Args:
+        duration_seconds: How long to listen (default 30).
+    """
+    c = _client()
+    collected: list[dict] = []
+    t = threading.Thread(target=c.events, kwargs={"callback": collected.append}, daemon=True)
+    t.start()
+    t.join(timeout=duration_seconds)
+    return json.dumps(collected, ensure_ascii=False, default=str) if collected else "No events"
 
 
 if __name__ == "__main__":

@@ -749,3 +749,14 @@ def config(ctx: click.Context, as_json: bool) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── mcp subcommand ──
+
+
+@main.command(hidden=True)
+def mcp() -> None:
+    """Start MCP stdio server."""
+    from octl.mcp_server import mcp as _mcp
+
+    _mcp.run(transport="stdio")
